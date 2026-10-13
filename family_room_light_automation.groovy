@@ -53,8 +53,8 @@
  *   event handlers (feedback loop guard).
  *
  * Author  : Evan
- * Version : 1.1.0
- * Date    : 2026-09-26
+ * Version : 1.1.2
+ * Date    : 2026-10-12
  */
 
 import groovy.transform.Field
@@ -249,10 +249,10 @@ private void resetTransientState() {
     state.overrideIsOn         = false  // Boolean: true if TEMP_OVERRIDE was entered via ON, false if via OFF
     state.lastMotionActiveTime = null   // Long   : epoch ms of last motion-active event
     state.overrideStartTime    = null   // Long   : epoch ms when current override began
-    state.appSettingLevel      = false  // Boolean: true while app is issuing setLevel()
-    state.appTurningOff        = false  // Boolean: true while app is issuing off()
-    state.syncingLightSwitch   = false  // Boolean: true while app syncs Light vswitch back to Alexa
-    state.syncingMovieSwitch   = false  // Boolean: true while app syncs Movie Mode vswitch back to Alexa
+    atomicState.appSettingLevel    = false  // Boolean: true while app is issuing setLevel()
+    atomicState.appTurningOff      = false  // Boolean: true while app is issuing off()
+    atomicState.syncingLightSwitch = false  // Boolean: true while app syncs Light vswitch back to Alexa
+    atomicState.syncingMovieSwitch = false  // Boolean: true while app syncs Movie Mode vswitch back to Alexa
     state.lastPhysicalOnTime   = 0L     // Long   : debounce timestamp for physical paddle ON
     state.lastPhysicalOffTime  = 0L     // Long   : debounce timestamp for physical paddle OFF
     logDebug "Transient state reset. lastManualLevel retained: ${state.lastManualLevel}"
@@ -327,12 +327,9 @@ def onMotionActive(evt) {
         case STATE_NORMAL:
             // Cancel any pending off-timer; motion is active again.
             unschedule("motionTimeoutHandler")
-            // Only send turn-on command if dimmer is currently off to avoid flooding Z-Wave mesh
-            if (dimmer?.currentValue("switch") != "on") {
-                turnOnToDefaultLevel()
-            } else {
-                logDebug "onMotionActive: light already ON in NORMAL — off-timer canceled, level preserved."
-            }
+            // Some dimmers do not reliably report physical state changes. Always send the
+            // idempotent level command rather than trusting a potentially stale cached state.
+            turnOnToDefaultLevel()
             break
 
         case STATE_TEMP_OVERRIDE:
@@ -438,8 +435,8 @@ def onButtonDoubleTapped(evt) {
 }
 
 def onDimmerSwitchOn(evt) {
-    logDebug "onDimmerSwitchOn: type=${evt.type}, isPhysical=${evt.isPhysical()}, appSettingLevel=${state.appSettingLevel}"
-    if (state.appSettingLevel) {
+    logDebug "onDimmerSwitchOn: type=${evt.type}, isPhysical=${evt.isPhysical()}, appSettingLevel=${atomicState.appSettingLevel}"
+    if (atomicState.appSettingLevel) {
         return
     }
     // Process physical paddle taps for drivers reporting switch events instead of pushed events
@@ -456,8 +453,8 @@ def onDimmerSwitchOn(evt) {
 }
 
 def onDimmerSwitchOff(evt) {
-    logDebug "onDimmerSwitchOff: type=${evt.type}, isPhysical=${evt.isPhysical()}, appTurningOff=${state.appTurningOff}"
-    if (state.appTurningOff) {
+    logDebug "onDimmerSwitchOff: type=${evt.type}, isPhysical=${evt.isPhysical()}, appTurningOff=${atomicState.appTurningOff}"
+    if (atomicState.appTurningOff) {
         return
     }
     if (evt.isPhysical() || evt.type == "physical") {
@@ -477,7 +474,7 @@ def onDimmerSwitchOff(evt) {
 // =============================================================================
 
 def onAlexaLightOn(evt) {
-    if (state.syncingLightSwitch) {
+    if (atomicState.syncingLightSwitch) {
         logDebug "onAlexaLightOn: sync in progress — skipping."
         return
     }
@@ -486,7 +483,7 @@ def onAlexaLightOn(evt) {
 }
 
 def onAlexaLightOff(evt) {
-    if (state.syncingLightSwitch) {
+    if (atomicState.syncingLightSwitch) {
         logDebug "onAlexaLightOff: sync in progress — skipping."
         return
     }
@@ -495,7 +492,7 @@ def onAlexaLightOff(evt) {
 }
 
 def onAlexaMovieOn(evt) {
-    if (state.syncingMovieSwitch) {
+    if (atomicState.syncingMovieSwitch) {
         logDebug "onAlexaMovieOn: sync in progress — skipping."
         return
     }
@@ -504,7 +501,7 @@ def onAlexaMovieOn(evt) {
 }
 
 def onAlexaMovieOff(evt) {
-    if (state.syncingMovieSwitch) {
+    if (atomicState.syncingMovieSwitch) {
         logDebug "onAlexaMovieOff: sync in progress — skipping."
         return
     }
@@ -519,7 +516,7 @@ def onAlexaMovieOff(evt) {
 def onLevelChanged(evt) {
     // This fires for EVERY level change, including those the app itself issues.
     // The appSettingLevel flag distinguishes app-driven from user-driven changes.
-    if (state.appSettingLevel) {
+    if (atomicState.appSettingLevel) {
         logDebug "onLevelChanged: app-initiated level ${evt.value}% — not memorizing."
         return
     }
@@ -905,22 +902,22 @@ def disableDebugLogging() {
 // =============================================================================
 
 def clearAppSettingLevel() {
-    state.appSettingLevel = false
+    atomicState.appSettingLevel = false
     logDebug "clearAppSettingLevel: flag cleared."
 }
 
 def clearAppTurningOff() {
-    state.appTurningOff = false
+    atomicState.appTurningOff = false
     logDebug "clearAppTurningOff: flag cleared."
 }
 
 def clearSyncingLightSwitch() {
-    state.syncingLightSwitch = false
+    atomicState.syncingLightSwitch = false
     logDebug "clearSyncingLightSwitch: flag cleared."
 }
 
 def clearSyncingMovieSwitch() {
-    state.syncingMovieSwitch = false
+    atomicState.syncingMovieSwitch = false
     logDebug "clearSyncingMovieSwitch: flag cleared."
 }
 
@@ -966,20 +963,16 @@ private int defaultLevel() {
 
 /**
  * Sets the dimmer to the given level and turns it on.
- * Avoids sending duplicate commands if already on at the target level.
+ * Commands are intentionally sent even when cached state already matches because some
+ * Z-Wave dimmers do not reliably report physical state changes.
  */
 private void setDimmerLevel(int level) {
     if (!dimmer) {
         logWarn "setDimmerLevel: dimmer device is null — cannot set level."
         return
     }
-    if (dimmer.currentValue("switch") == "on" && dimmer.currentValue("level") == level) {
-        logDebug "setDimmerLevel: dimmer already ON at ${level}% — skipping redundant command."
-        syncAlexaLightSwitchOn()
-        return
-    }
     logInfo "Setting dimmer to ${level}%."
-    state.appSettingLevel = true
+    atomicState.appSettingLevel = true
     dimmer.setLevel(level)
     runIn(FLAG_CLEAR_DELAY_SEC, "clearAppSettingLevel")
     syncAlexaLightSwitchOn()
@@ -987,20 +980,15 @@ private void setDimmerLevel(int level) {
 
 /**
  * Turns the dimmer off.
- * Avoids sending duplicate commands if already off.
+ * The command is always sent because cached device state may be stale.
  */
 private void turnDimmerOff() {
     if (!dimmer) {
         logWarn "turnDimmerOff: dimmer device is null — cannot turn off."
         return
     }
-    if (dimmer.currentValue("switch") == "off") {
-        logDebug "turnDimmerOff: dimmer already OFF — skipping redundant command."
-        syncAlexaLightSwitchOff()
-        return
-    }
     logInfo "Turning dimmer OFF."
-    state.appTurningOff = true
+    atomicState.appTurningOff = true
     dimmer.off()
     runIn(FLAG_CLEAR_DELAY_SEC, "clearAppTurningOff")
     syncAlexaLightSwitchOff()
@@ -1013,7 +1001,7 @@ private void syncAlexaLightSwitchOn() {
     if (!alexaLightSwitch) return
     if (alexaLightSwitch.currentValue("switch") == "on") return
     logDebug "syncAlexaLightSwitchOn: syncing alexaLightSwitch to ON."
-    state.syncingLightSwitch = true
+    atomicState.syncingLightSwitch = true
     alexaLightSwitch.on()
     runIn(FLAG_CLEAR_DELAY_SEC, "clearSyncingLightSwitch")
 }
@@ -1025,7 +1013,7 @@ private void syncAlexaLightSwitchOff() {
     if (!alexaLightSwitch) return
     if (alexaLightSwitch.currentValue("switch") == "off") return
     logDebug "syncAlexaLightSwitchOff: syncing alexaLightSwitch to OFF."
-    state.syncingLightSwitch = true
+    atomicState.syncingLightSwitch = true
     alexaLightSwitch.off()
     runIn(FLAG_CLEAR_DELAY_SEC, "clearSyncingLightSwitch")
 }
@@ -1037,7 +1025,7 @@ private void syncMovieSwitchOff() {
     if (!alexaMovieSwitch) return
     if (alexaMovieSwitch.currentValue("switch") == "off") return
     logDebug "syncMovieSwitchOff: writing OFF to alexaMovieSwitch."
-    state.syncingMovieSwitch = true
+    atomicState.syncingMovieSwitch = true
     alexaMovieSwitch.off()
     runIn(FLAG_CLEAR_DELAY_SEC, "clearSyncingMovieSwitch")
 }
